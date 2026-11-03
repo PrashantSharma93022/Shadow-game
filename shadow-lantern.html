@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow Lantern</title>
+<style>
+  html, body { margin:0; height:100%; background:#02030a; color:#c9b27a; font-family:"Segoe UI",Arial,sans-serif; }
+  #wrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; }
+  canvas { max-width:100%; max-height:90vh; border:3px solid #6b5a2e; border-radius:10px;
+           box-shadow:0 0 30px #c9a24d55; background:#000; touch-action:none; cursor:none; }
+  .hint { font-size:14px; margin-top:10px; opacity:.8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="900" height="600"></canvas>
+  <p class="hint">Mouse / touch / WASD / arrows to move &middot; P = pause &middot; M = mute</p>
+</div>
+<script>
+/* =====================================================================
+   SHADOW LANTERN - 2D Arcade Game (HTML5 Canvas + JavaScript)
+   Multimedia Systems Lab - Lab Test 2
+   Graphics are drawn in code, sounds are generated with Web Audio.
+   No external assets / libraries.
+   ===================================================================== */
+
+/* ---------- CUSTOMIZATION (change values here) ---------- */
+const CONFIG = {
+  title: "SHADOW LANTERN",
+  startLives: 3,
+  fireflyPoints: 10,
+  shardPoints: 25,
+  maxLight: 230,         // biggest lantern radius
+  minLight: 55,          // smallest lantern radius
+  startLight: 170,
+  fireflyLightBoost: 30, // light gained per firefly
+  baseDrain: 7,          // light lost per second (level 1)
+  drainPerLevel: 1.2,
+  dimThreshold: 80,      // below this radius ghosts get ENRAGED (faster)
+  enrageFactor: 1.4,
+  ghostBaseSpeed: 55,
+  ghostSpeedPerLevel: 12,
+  maxGhostSpeed: 150,
+  baseGhosts: 2,         // ghosts at level 1 (+1 per level)
+  maxGhosts: 9,
+  levelEvery: 100,       // score per level
+  revealTime: 3.5,       // seconds of Moon Shard effect
+  invulnTime: 1.5,       // seconds of protection after a hit
+  hitLightReset: 140
+};
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+/* Game states */
+const START = "START", PLAYING = "PLAYING", PAUSED = "PAUSED", OVER = "GAMEOVER";
+let state = START;
+
+let score, lives, level, light, revealTimer, invuln, shake;
+let ghosts, flies, shards, particles, popups;
+let ghostTimer, shardTimer, heartTimer, t = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem("shadowLanternHS")) || 0; } catch (e) {}
+
+const player = { x: W/2, y: H/2, r: 12, speed: 300 };
+const keys = {};
+const mouse = { x: W/2, y: H/2, active: false };
+
+/* ---------- Offscreen canvases ---------- */
+const bg = document.createElement("canvas"); bg.width = W; bg.height = H;      // pre-drawn forest
+const dark = document.createElement("canvas"); dark.width = W; dark.height = H; // darkness mask
+const dctx = dark.getContext("2d");
+
+/* Procedural forest background (drawn once) */
+(function buildBackground() {
+  const b = bg.getContext("2d");
+  const g = b.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0b1a14"); g.addColorStop(1, "#14281a");
+  b.fillStyle = g; b.fillRect(0, 0, W, H);
+  // grass tufts
+  for (let i = 0; i < 400; i++) {
+    const x = Math.random() * W, y = Math.random() * H;
+    b.strokeStyle = "rgba(60,120,70," + (0.2 + Math.random() * 0.3) + ")";
+    b.lineWidth = 1.5; b.beginPath();
+    b.moveTo(x, y); b.lineTo(x - 3, y - 8); b.moveTo(x, y); b.lineTo(x + 3, y - 9); b.stroke();
+  }
+  // trees
+  for (let i = 0; i < 26; i++) {
+    const x = Math.random() * W, y = 40 + Math.random() * (H - 60), s = 30 + Math.random() * 40;
+    b.fillStyle = "#3a2a1a"; b.fillRect(x - 4, y, 8, s * 0.6);
+    for (let k = 0; k < 3; k++) {
+      b.fillStyle = k % 2 ? "#12351f" : "#0f2d1a";
+      b.beginPath(); b.moveTo(x, y - s + k * 14); b.lineTo(x + s * 0.6, y + k * 14 - 6); b.lineTo(x - s * 0.6, y + k * 14 - 6); b.fill();
+    }
+  }
+  // moon
+  b.fillStyle = "rgba(230,235,255,.12)"; b.beginPath(); b.arc(780, 90, 50, 0, 7); b.fill();
+  b.fillStyle = "rgba(230,235,255,.35)"; b.beginPath(); b.arc(780, 90, 34, 0, 7); b.fill();
+})();
+
+const fog = Array.from({ length: 7 }, () => ({
+  x: Math.random() * W, y: Math.random() * H, r: 90 + Math.random() * 90, v: 6 + Math.random() * 10
+}));
+
+/* ---------- Sound (Web Audio) ---------- */
+let audio = null, muted = false, musicTimer = null, musicStep = 0;
+function initAudio() {
+  if (!audio) { try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (audio && audio.state === "suspended") audio.resume();
+}
+function beep(freq, dur, type = "sine", vol = 0.15, slideTo = null) {
+  if (!audio || muted) return;
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, audio.currentTime);
+  if (slideTo) o.frequency.linearRampToValueAtTime(slideTo, audio.currentTime + dur);
+  g.gain.setValueAtTime(vol, audio.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
+  o.connect(g); g.connect(audio.destination);
+  o.start(); o.stop(audio.currentTime + dur);
+}
+const sfx = {
+  fly:   () => { beep(880, 0.12, "sine", 0.15); setTimeout(() => beep(1320, 0.15, "sine", 0.1), 70); },
+  hit:   () => beep(180, 0.45, "sawtooth", 0.22, 50),
+  shard: () => { beep(500, 0.5, "triangle", 0.18, 1400); },
+  level: () => { beep(392, 0.15, "square", 0.08); setTimeout(() => beep(587, 0.25, "square", 0.08), 140); },
+  heart: () => beep(70, 0.12, "sine", 0.25),
+  over:  () => beep(300, 1.0, "sawtooth", 0.2, 40)
+};
+function startMusic() {   // slow ambient pentatonic
+  stopMusic();
+  const notes = [196, 233, 262, 294, 349, 294, 262, 233];
+  musicTimer = setInterval(() => {
+    if (state === PLAYING) beep(notes[musicStep++ % notes.length] / 2, 1.2, "sine", 0.05);
+  }, 900);
+}
+function stopMusic() { if (musicTimer) clearInterval(musicTimer); musicTimer = null; }
+
+/* ---------- Game control ---------- */
+function resetGame() {
+  score = 0; lives = CONFIG.startLives; level = 1; light = CONFIG.startLight;
+  revealTimer = 0; invuln = 0; shake = 0;
+  ghosts = []; flies = []; shards = []; particles = []; popups = [];
+  ghostTimer = 1; shardTimer = 12; heartTimer = 0;
+  player.x = W / 2; player.y = H / 2;
+  while (flies.length < 5) spawnFly();
+}
+function startGame() { initAudio(); resetGame(); state = PLAYING; startMusic(); }
+function gameOver() {
+  state = OVER; sfx.over(); stopMusic();
+  if (score > highScore) { highScore = score; try { localStorage.setItem("shadowLanternHS", highScore); } catch (e) {} }
+}
+
+/* ---------- Input events ---------- */
+window.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (["arrowleft","arrowright","arrowup","arrowdown"," "].includes(k)) e.preventDefault();
+  if ((k === "enter" || k === " ") && (state === START || state === OVER)) startGame();
+  else if (k === "p") { if (state === PLAYING) state = PAUSED; else if (state === PAUSED) state = PLAYING; }
+  else if (k === "m") muted = !muted;
+});
+window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+function toCanvas(cx, cy) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (cx - r.left) * (W / r.width), y: (cy - r.top) * (H / r.height) };
+}
+canvas.addEventListener("mousemove", e => { const p = toCanvas(e.clientX, e.clientY); mouse.x = p.x; mouse.y = p.y; mouse.active = true; });
+canvas.addEventListener("touchmove", e => { const p = toCanvas(e.touches[0].clientX, e.touches[0].clientY); mouse.x = p.x; mouse.y = p.y; mouse.active = true; e.preventDefault(); }, { passive: false });
+canvas.addEventListener("touchstart", e => {
+  const p = toCanvas(e.touches[0].clientX, e.touches[0].clientY); mouse.x = p.x; mouse.y = p.y; mouse.active = true;
+  if (state === START || state === OVER) startGame(); e.preventDefault();
+}, { passive: false });
+canvas.addEventListener("click", () => { if (state === START || state === OVER) startGame(); });
+
+/* ---------- Spawning ---------- */
+function spawnFly() {
+  flies.push({ x: 40 + Math.random() * (W - 80), y: 60 + Math.random() * (H - 100), ph: Math.random() * 6.28, sp: 15 + Math.random() * 20, ang: Math.random() * 6.28 });
+}
+function spawnGhost() {
+  let x, y; const side = Math.floor(Math.random() * 4);
+  if (side === 0) { x = -30; y = Math.random() * H; }
+  else if (side === 1) { x = W + 30; y = Math.random() * H; }
+  else if (side === 2) { x = Math.random() * W; y = -30; }
+  else { x = Math.random() * W; y = H + 30; }
+  ghosts.push({ x, y, r: 16, ph: Math.random() * 6.28 });
+}
+function spawnShard() {
+  shards.push({ x: 60 + Math.random() * (W - 120), y: 70 + Math.random() * (H - 130), life: 11 });
+}
+function burst(x, y, color, n = 14) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, s = 40 + Math.random() * 140;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.7, color });
+  }
+}
+function popup(txt, x, y, color) { popups.push({ txt, x, y, life: 1, color }); }
+
+/* ---------- Collision detection: CIRCLE vs CIRCLE ----------
+   Two circles touch when the distance between centres is less than the
+   sum of radii. To avoid slow sqrt we compare squared values:
+       dx*dx + dy*dy < (r1 + r2)^2                                    */
+function hit(a, ra, b, rb) {
+  const dx = a.x - b.x, dy = a.y - b.y, rr = ra + rb;
+  return dx * dx + dy * dy < rr * rr;
+}
+
+/* ---------- Update ---------- */
+function update(dt) {
+  t += dt;
+  fog.forEach(f => { f.x += f.v * dt; if (f.x - f.r > W) f.x = -f.r; });
+
+  if (state === START) { // demo: lantern follows mouse on title screen
+    player.x += (mouse.x - player.x) * Math.min(1, 6 * dt);
+    player.y += (mouse.y - player.y) * Math.min(1, 6 * dt);
+    return;
+  }
+  if (state !== PLAYING) return;
+
+  /* movement: keyboard OR mouse/touch */
+  let dx = (keys["arrowright"] || keys["d"] ? 1 : 0) - (keys["arrowleft"] || keys["a"] ? 1 : 0);
+  let dy = (keys["arrowdown"] || keys["s"] ? 1 : 0) - (keys["arrowup"] || keys["w"] ? 1 : 0);
+  if (dx || dy) {
+    const len = Math.hypot(dx, dy);
+    player.x += dx / len * player.speed * dt; player.y += dy / len * player.speed * dt; mouse.active = false;
+  } else if (mouse.active) {
+    const mx = mouse.x - player.x, my = mouse.y - player.y, d = Math.hypot(mx, my);
+    if (d > 2) { const step = Math.min(d, player.speed * dt); player.x += mx / d * step; player.y += my / d * step; }
+  }
+  player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+  player.y = Math.max(player.r + 50, Math.min(H - player.r, player.y));
+
+  /* lantern light drains over time (difficulty rises with level) */
+  light -= (CONFIG.baseDrain + (level - 1) * CONFIG.drainPerLevel) * dt;
+  light = Math.max(CONFIG.minLight, light);
+
+  if (revealTimer > 0) revealTimer -= dt;
+  if (invuln > 0) invuln -= dt;
+  if (shake > 0) shake -= dt;
+
+  /* spawning */
+  while (flies.length < 5) spawnFly();
+  const wantGhosts = Math.min(CONFIG.maxGhosts, CONFIG.baseGhosts + level - 1);
+  ghostTimer -= dt;
+  if (ghosts.length < wantGhosts && ghostTimer <= 0) { spawnGhost(); ghostTimer = 1.5; }
+  shardTimer -= dt;
+  if (shardTimer <= 0 && shards.length === 0) { spawnShard(); shardTimer = 16 + Math.random() * 8; }
+
+  /* fireflies wander randomly */
+  for (let i = flies.length - 1; i >= 0; i--) {
+    const f = flies[i];
+    f.ang += (Math.random() - 0.5) * 3 * dt; f.ph += dt * 4;
+    f.x += Math.cos(f.ang) * f.sp * dt; f.y += Math.sin(f.ang) * f.sp * dt;
+    if (f.x < 20 || f.x > W - 20) f.ang = Math.PI - f.ang;
+    if (f.y < 70 || f.y > H - 20) f.ang = -f.ang;
+    if (hit(f, 8, player, player.r + 6)) {
+      score += CONFIG.fireflyPoints;
+      light = Math.min(CONFIG.maxLight, light + CONFIG.fireflyLightBoost);
+      popup("+" + CONFIG.fireflyPoints, f.x, f.y, "#ffe27a");
+      burst(f.x, f.y, "#ffe27a", 10); sfx.fly();
+      flies.splice(i, 1);
+    }
+  }
+
+  /* Moon Shard: special object (reveal all + freeze ghosts) */
+  for (let i = shards.length - 1; i >= 0; i--) {
+    const s = shards[i]; s.life -= dt;
+    if (hit(s, 14, player, player.r)) {
+      revealTimer = CONFIG.revealTime; score += CONFIG.shardPoints;
+      light = Math.min(CONFIG.maxLight, light + 40);
+      popup("MOON SHARD!", s.x, s.y, "#bfe3ff"); burst(s.x, s.y, "#bfe3ff", 24); sfx.shard();
+      shards.splice(i, 1);
+    } else if (s.life <= 0) shards.splice(i, 1);
+  }
+
+  /* ghosts chase the player */
+  const enraged = light < CONFIG.dimThreshold;
+  let nearest = 1e9;
+  for (let i = ghosts.length - 1; i >= 0; i--) {
+    const g = ghosts[i];
+    g.ph += dt * 3;
+    let sp = Math.min(CONFIG.maxGhostSpeed, CONFIG.ghostBaseSpeed + (level - 1) * CONFIG.ghostSpeedPerLevel);
+    if (enraged) sp *= CONFIG.enrageFactor;
+    if (revealTimer > 0) sp = 0;
+    const gx = player.x - g.x, gy = player.y - g.y, d = Math.hypot(gx, gy) || 1;
+    nearest = Math.min(nearest, d);
+    g.x += gx / d * sp * dt + Math.cos(g.ph) * 20 * dt;
+    g.y += gy / d * sp * dt + Math.sin(g.ph * 1.3) * 20 * dt;
+    if (invuln <= 0 && hit(g, g.r - 2, player, player.r - 2)) {
+      lives--; invuln = CONFIG.invulnTime; shake = 0.4;
+      light = Math.max(light, CONFIG.hitLightReset);
+      burst(player.x, player.y, "#9a7bff", 24); popup("-1 LIFE", player.x, player.y - 20, "#ff7b7b"); sfx.hit();
+      ghosts.splice(i, 1);
+      if (lives <= 0) { gameOver(); return; }
+    }
+  }
+  /* heartbeat warning when a ghost is close */
+  heartTimer -= dt;
+  if (nearest < 170 && heartTimer <= 0) { sfx.heart(); heartTimer = 0.25 + nearest / 400; }
+
+  /* level up */
+  const nl = 1 + Math.floor(score / CONFIG.levelEvery);
+  if (nl > level) { level = nl; sfx.level(); popup("LEVEL " + level, W / 2, H / 2, "#ffe27a"); }
+
+  particles.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; });
+  particles = particles.filter(p => p.life > 0);
+  popups.forEach(p => { p.y -= 35 * dt; p.life -= dt; });
+  popups = popups.filter(p => p.life > 0);
+}
+
+/* ---------- Drawing ---------- */
+function text(str, x, y, size, color = "#fff", align = "center") {
+  ctx.fillStyle = color; ctx.font = "bold " + size + "px 'Segoe UI', Arial"; ctx.textAlign = align; ctx.fillText(str, x, y);
+}
+function drawGhost(g) {
+  ctx.save(); ctx.translate(g.x, g.y + Math.sin(g.ph) * 3);
+  ctx.fillStyle = "rgba(210,200,255,.92)";
+  ctx.beginPath(); ctx.arc(0, -2, g.r, Math.PI, 0);
+  ctx.lineTo(g.r, g.r);
+  for (let i = 0; i < 4; i++) { const x = g.r - (i + 0.5) * (g.r * 0.5); ctx.lineTo(x, g.r - 6 + (i % 2 ? 0 : 7)); }
+  ctx.lineTo(-g.r, g.r); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#1a1030";
+  ctx.beginPath(); ctx.arc(-5, -4, 3, 0, 7); ctx.arc(5, -4, 3, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, 5, 3, 4, 0, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function drawPlayer() {
+  if (invuln > 0 && Math.floor(t * 12) % 2) return; // blink when invulnerable
+  ctx.save(); ctx.translate(player.x, player.y);
+  ctx.fillStyle = "#2f3f7a"; ctx.beginPath(); ctx.moveTo(0, -4); ctx.lineTo(11, 15); ctx.lineTo(-11, 15); ctx.fill();   // cloak
+  ctx.fillStyle = "#f1c9a0"; ctx.beginPath(); ctx.arc(0, -8, 7, 0, 7); ctx.fill();                                       // head
+  ctx.fillStyle = "#c0392b"; ctx.beginPath(); ctx.arc(0, -11, 7, Math.PI, 0); ctx.fill();                                 // hat
+  ctx.strokeStyle = "#6b4a1a"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(10, 3); ctx.lineTo(16, -2); ctx.stroke();  // lantern hand
+  ctx.fillStyle = "#ffd36b"; ctx.shadowColor = "#ffb347"; ctx.shadowBlur = 14;
+  ctx.fillRect(13, -4, 8, 10); ctx.shadowBlur = 0;
+  ctx.restore();
+}
+function drawScene() {
+  ctx.drawImage(bg, 0, 0);
+  fog.forEach(f => {
+    const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, f.r);
+    g.addColorStop(0, "rgba(180,200,200,.10)"); g.addColorStop(1, "rgba(180,200,200,0)");
+    ctx.fillStyle = g; ctx.fillRect(f.x - f.r, f.y - f.r, f.r * 2, f.r * 2);
+  });
+  ghosts.forEach(drawGhost);   // drawn BEFORE darkness -> hidden outside the light
+}
+function drawDarkness() {
+  const dim = revealTimer > 0 ? 0.2 : 0.97;
+  dctx.globalCompositeOperation = "source-over";
+  dctx.clearRect(0, 0, W, H);
+  dctx.fillStyle = "rgba(0,0,10," + dim + ")"; dctx.fillRect(0, 0, W, H);
+  dctx.globalCompositeOperation = "destination-out";
+  const R = light * (1 + 0.03 * Math.sin(t * 18));
+  const lx = player.x + 16, ly = player.y;
+  const g = dctx.createRadialGradient(lx, ly, 0, lx, ly, R);
+  g.addColorStop(0, "rgba(0,0,0,1)"); g.addColorStop(0.65, "rgba(0,0,0,.9)"); g.addColorStop(1, "rgba(0,0,0,0)");
+  dctx.fillStyle = g; dctx.fillRect(0, 0, W, H);
+  // fireflies cast a tiny light too
+  flies.forEach(f => {
+    const fg = dctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, 34);
+    fg.addColorStop(0, "rgba(0,0,0,.8)"); fg.addColorStop(1, "rgba(0,0,0,0)");
+    dctx.fillStyle = fg; dctx.fillRect(f.x - 34, f.y - 34, 68, 68);
+  });
+  ctx.drawImage(dark, 0, 0);
+  // warm lantern tint
+  const wg = ctx.createRadialGradient(lx, ly, 0, lx, ly, R);
+  wg.addColorStop(0, "rgba(255,190,90,.22)"); wg.addColorStop(1, "rgba(255,190,90,0)");
+  ctx.fillStyle = wg; ctx.fillRect(0, 0, W, H);
+}
+function drawGlowItems() {
+  flies.forEach(f => {
+    const a = 0.55 + 0.45 * Math.sin(f.ph);
+    ctx.fillStyle = "rgba(255,230,120," + a + ")"; ctx.shadowColor = "#ffe27a"; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(f.x, f.y, 4, 0, 7); ctx.fill();
+  });
+  shards.forEach(s => {
+    ctx.shadowColor = "#bfe3ff"; ctx.shadowBlur = 22;
+    ctx.fillStyle = "#e8f4ff"; ctx.beginPath(); ctx.arc(s.x, s.y, 12, 0, 7); ctx.fill();
+    ctx.fillStyle = "#6a8fc0"; ctx.beginPath(); ctx.arc(s.x + 5, s.y - 2, 10, 0, 7); ctx.fill(); // crescent
+  });
+  ctx.shadowBlur = 0;
+}
+function drawHUD() {
+  text("Score: " + score, 15, 28, 22, "#ffe27a", "left");
+  text("Level " + level, 15, 46, 14, "#c9b27a", "left");
+  text("Best " + highScore, W / 2, 20, 14, "#c9b27a");
+  for (let i = 0; i < lives; i++) text("\u2665", W - 20 - i * 30, 32, 28, "#ff5d73", "right");
+  // light meter
+  const mw = 220, frac = (light - CONFIG.minLight) / (CONFIG.maxLight - CONFIG.minLight);
+  ctx.fillStyle = "rgba(255,255,255,.12)"; ctx.fillRect(W / 2 - mw / 2, 28, mw, 10);
+  ctx.fillStyle = light < CONFIG.dimThreshold ? "#ff5d5d" : "#ffc65a"; ctx.fillRect(W / 2 - mw / 2, 28, mw * frac, 10);
+  text("LANTERN LIGHT", W / 2, 54, 11, "#c9b27a");
+  if (light < CONFIG.dimThreshold && Math.floor(t * 3) % 2) text("Light fading! Catch fireflies - ghosts are faster in the dark!", W / 2, H - 14, 15, "#ff8a8a");
+  if (revealTimer > 0) text("MOON SHARD: ghosts frozen!", W / 2, H - 14, 16, "#bfe3ff");
+  if (muted) text("MUTED", 15, H - 12, 13, "#999", "left");
+}
+function overlay() { ctx.fillStyle = "rgba(0,0,8,.72)"; ctx.fillRect(0, 0, W, H); }
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12);
+  drawScene();
+  drawDarkness();
+  drawGlowItems();
+  if (state !== START) {
+    drawPlayer();
+    particles.forEach(p => { ctx.globalAlpha = Math.max(0, p.life / 0.7); ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, 4, 4); });
+    ctx.globalAlpha = 1;
+    popups.forEach(p => { ctx.globalAlpha = Math.min(1, p.life * 1.5); text(p.txt, p.x, p.y, 20, p.color); });
+    ctx.globalAlpha = 1;
+    drawHUD();
+  }
+  if (state === START) {
+    drawPlayer();
+    ctx.fillStyle = "rgba(0,0,8,.5)"; ctx.fillRect(0, 0, W, H);
+    text(CONFIG.title, W / 2, 110, 58, "#ffd36b");
+    text("Light your way through the haunted forest", W / 2, 150, 20, "#c9b27a");
+    text("HOW TO PLAY", W / 2, 210, 22, "#ffe27a");
+    text("\u2726 Catch Fireflies: +" + CONFIG.fireflyPoints + " points and refill your lantern light", W / 2, 245, 17);
+    text("\u2620 Ghosts hide in the dark and chase you: touching one costs a life", W / 2, 273, 17);
+    text("\u263E Moon Shard: lights the whole forest and freezes ghosts for " + CONFIG.revealTime + "s", W / 2, 301, 17);
+    text("Your light keeps shrinking. In the dark, ghosts get faster!", W / 2, 329, 17, "#ff9a9a");
+    text("Every " + CONFIG.levelEvery + " points = new level: more and faster ghosts", W / 2, 357, 16, "#aab");
+    text("Move: Mouse / Touch / WASD / Arrows    Pause: P    Mute: M", W / 2, 400, 16, "#c9b27a");
+    if (Math.floor(performance.now() / 500) % 2) text("Press ENTER or click to START", W / 2, 470, 26, "#ffd36b");
+    text("Best score: " + highScore, W / 2, 520, 18, "#ffe27a");
+  }
+  if (state === PAUSED) { overlay(); text("PAUSED", W / 2, H / 2, 54, "#ffd36b"); text("Press P to resume", W / 2, H / 2 + 40, 20); }
+  if (state === OVER) {
+    overlay();
+    text("THE LIGHT WENT OUT", W / 2, 190, 52, "#ff7b7b");
+    text("Final Score: " + score, W / 2, 265, 32);
+    text("Level reached: " + level, W / 2, 305, 22, "#ffd36b");
+    text(score >= highScore && score > 0 ? "NEW HIGH SCORE!" : "Best: " + highScore, W / 2, 345, 22, "#8affb0");
+    if (Math.floor(performance.now() / 500) % 2) text("Press ENTER or click to PLAY AGAIN", W / 2, 430, 24, "#ffd36b");
+  }
+  ctx.restore();
+}
+
+/* ---------- Main loop ---------- */
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+resetGame();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
